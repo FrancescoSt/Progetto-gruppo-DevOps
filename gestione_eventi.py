@@ -3,15 +3,16 @@ gestione_eventi.py
 ==================
 Programma per la gestione di eventi musicali (concerti, workshop, DJ set),
 prenotazioni, partecipanti e disponibilità dei posti.
-Interfaccia da terminale, dati salvati in un database SQLite locale.
+Interfaccia da terminale, dati salvati in un file JSON locale
+("eventi_musicali.json"), creato automaticamente al primo avvio.
 
 Uso:
     python gestione_eventi.py                 avvia il programma (menu)
-    python gestione_eventi.py --dati-esempio  ricrea il database con dati dimostrativi
+    python gestione_eventi.py --dati-esempio  ricrea il file dei dati con dati dimostrativi
     python gestione_eventi.py --test          esegue i test automatici
 
 Il file è diviso in sezioni:
-    1. DATABASE      connessione e creazione delle tabelle
+    1. ARCHIVIO      lettura e salvataggio dei dati nel file JSON
     2. UTENTI        registrazione, login, password protette e ruoli
     3. EVENTI        creazione, posti disponibili, annullamento e notifiche
     4. PRENOTAZIONI  prenotazioni, approvazione workshop e pagamenti
@@ -24,22 +25,36 @@ Il file è diviso in sezioni:
 import getpass
 import hashlib
 import hmac
+import json
 import os
 import re
-import sqlite3
 import sys
+import tempfile
 import time
 import unittest
 from datetime import datetime
 
 
-
 # ===========================================================================
-# 1. DATABASE: connessione e creazione delle tabelle
+# 1. ARCHIVIO: lettura e salvataggio dei dati nel file JSON
 # ===========================================================================
+#
+# Tutti i dati stanno in un unico file JSON con questa struttura:
+#
+#   {
+#     "ultimo_id":    {"utenti": 4, "eventi": 3, "prenotazioni": 5, "notifiche": 0},
+#     "utenti":       [ {"id": 1, "username": "admin", ...}, ... ],
+#     "eventi":       [ {"id": 1, "nome": "...", "tipo": "concerto", ...}, ... ],
+#     "prenotazioni": [ {"id": 1, "utente_id": 2, "evento_id": 1, "posti": [5, 6], ...}, ... ],
+#     "notifiche":    [ {"id": 1, "utente_id": 2, "evento_id": 1, "messaggio": "..."}, ... ]
+#   }
+#
+# "ultimo_id" serve a dare a ogni nuovo elemento un numero identificativo
+# (id) mai usato prima, come farebbe un database.
 
-# Percorso del file del database (stessa cartella di questo file)
-PERCORSO_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eventi_musicali.db")
+# Percorso del file dei dati (stessa cartella di questo programma)
+PERCORSO_DATI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eventi_musicali.json")
+ELENCHI = ("utenti", "eventi", "prenotazioni", "notifiche")
 
 
 class ErroreGestione(Exception):
@@ -50,79 +65,70 @@ class ErroreGestione(Exception):
     """
 
 
-# Istruzioni SQL per creare le tabelle (solo se non esistono già)
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS utenti (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT NOT NULL UNIQUE,
-    nome          TEXT NOT NULL,
-    email         TEXT NOT NULL,
-    password_hash TEXT NOT NULL,          -- hash della password, MAI la password in chiaro
-    salt          TEXT NOT NULL,          -- valore casuale usato per l'hash
-    ruolo         TEXT NOT NULL CHECK (ruolo IN ('organizzatore', 'collaboratore', 'partecipante'))
-);
-
-CREATE TABLE IF NOT EXISTS eventi (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    nome        TEXT NOT NULL,
-    tipo        TEXT NOT NULL CHECK (tipo IN ('concerto', 'workshop', 'dj_set')),
-    data_ora    TEXT NOT NULL,            -- formato 'AAAA-MM-GG HH:MM'
-    luogo       TEXT NOT NULL,
-    descrizione TEXT NOT NULL DEFAULT '',
-    capienza    INTEGER NOT NULL CHECK (capienza > 0),
-    prezzo      REAL NOT NULL DEFAULT 0 CHECK (prezzo >= 0),
-    stato       TEXT NOT NULL DEFAULT 'attivo' CHECK (stato IN ('attivo', 'annullato')),
-    creato_da   INTEGER REFERENCES utenti(id)
-);
-
-CREATE TABLE IF NOT EXISTS prenotazioni (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    utente_id         INTEGER NOT NULL REFERENCES utenti(id),
-    evento_id         INTEGER NOT NULL REFERENCES eventi(id),
-    num_posti         INTEGER NOT NULL CHECK (num_posti > 0),
-    stato             TEXT NOT NULL CHECK (stato IN ('in_attesa', 'confermata', 'rifiutata', 'annullata')),
-    importo           REAL NOT NULL DEFAULT 0,
-    stato_pagamento   TEXT NOT NULL CHECK (stato_pagamento IN
-                          ('gratuito', 'non_pagato', 'pagato', 'da_rimborsare', 'rimborsato')),
-    data_prenotazione TEXT NOT NULL
-);
-
--- Posti numerati dei concerti: un posto è libero se prenotazione_id è NULL
-CREATE TABLE IF NOT EXISTS posti (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    evento_id       INTEGER NOT NULL REFERENCES eventi(id),
-    numero          INTEGER NOT NULL,
-    prenotazione_id INTEGER REFERENCES prenotazioni(id),
-    UNIQUE (evento_id, numero)
-);
-
--- Notifiche simulate (es. annullamento di un evento)
-CREATE TABLE IF NOT EXISTS notifiche (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    utente_id  INTEGER NOT NULL REFERENCES utenti(id),
-    evento_id  INTEGER NOT NULL REFERENCES eventi(id),
-    messaggio  TEXT NOT NULL,
-    data_invio TEXT NOT NULL
-);
-"""
-
-
-def connetti(percorso=PERCORSO_DB):
+class Archivio:
     """
-    Apre la connessione al database e crea le tabelle se mancano.
-    Con percorso=":memory:" crea un database temporaneo in memoria (usato nei test).
+    Tiene in memoria tutti i dati del programma e li salva nel file JSON.
+    Con percorso=None i dati restano solo in memoria (usato nei test).
     """
-    conn = sqlite3.connect(percorso)
-    conn.row_factory = sqlite3.Row          # permette di leggere le colonne per nome: riga["nome"]
-    conn.execute("PRAGMA foreign_keys = ON")  # attiva il controllo delle chiavi esterne
-    crea_tabelle(conn)
-    return conn
+
+    def __init__(self, percorso=PERCORSO_DATI):
+        self.percorso = percorso
+        self.dati = {"ultimo_id": {nome: 0 for nome in ELENCHI}}
+        for nome in ELENCHI:
+            self.dati[nome] = []
+        if percorso is not None and os.path.exists(percorso):
+            self.carica()
+
+    def carica(self):
+        """Legge il file JSON. Se il file è rovinato si ferma, così non viene sovrascritto."""
+        try:
+            with open(self.percorso, encoding="utf-8") as file:
+                dati = json.load(file)
+        except (OSError, json.JSONDecodeError) as errore:
+            raise ErroreGestione(f"Impossibile leggere il file dei dati '{self.percorso}': {errore}")
+        if (not isinstance(dati, dict) or "ultimo_id" not in dati
+                or any(not isinstance(dati.get(nome), list) for nome in ELENCHI)):
+            raise ErroreGestione(f"Il file '{self.percorso}' non ha il formato previsto.")
+        self.dati = dati
+
+    def salva(self):
+        """
+        Scrive tutti i dati nel file JSON.
+        Prima scrive un file temporaneo e poi lo rinomina: così, se il programma
+        si interrompe a metà del salvataggio, il file precedente resta integro.
+        """
+        if self.percorso is None:
+            return
+        temporaneo = self.percorso + ".tmp"
+        try:
+            with open(temporaneo, "w", encoding="utf-8") as file:
+                json.dump(self.dati, file, indent=2, ensure_ascii=False)
+            os.replace(temporaneo, self.percorso)
+        except OSError as errore:
+            raise ErroreGestione(f"Impossibile salvare i dati nel file '{self.percorso}': {errore}")
+
+    def elenco(self, nome):
+        """Restituisce la lista di un tipo di dati (es. elenco('eventi'))."""
+        return self.dati[nome]
+
+    def trova(self, nome, id_cercato):
+        """Restituisce l'elemento con l'id indicato, oppure None se non esiste."""
+        for elemento in self.dati[nome]:
+            if elemento["id"] == id_cercato:
+                return elemento
+        return None
+
+    def inserisci(self, nome, elemento):
+        """Aggiunge un elemento assegnandogli un nuovo id e lo restituisce (non salva su file)."""
+        self.dati["ultimo_id"][nome] += 1
+        elemento = {"id": self.dati["ultimo_id"][nome], **elemento}
+        self.dati[nome].append(elemento)
+        return elemento
 
 
-def crea_tabelle(conn):
-    """Crea tutte le tabelle del programma (se non esistono già)."""
-    conn.executescript(SCHEMA_SQL)
-    conn.commit()
+def apri_archivio(percorso=PERCORSO_DATI):
+    """Apre il file dei dati (se non esiste, si parte da un archivio vuoto)."""
+    return Archivio(percorso)
 
 
 # ===========================================================================
@@ -173,11 +179,20 @@ def normalizza_username(username):
     return (username or "").strip().lower()
 
 
-def controlla_username(conn, username):
+def cerca_utente(db, username):
+    """Restituisce l'utente con quello username, oppure None."""
+    username = normalizza_username(username)
+    for utente in db.elenco("utenti"):
+        if utente["username"] == username:
+            return utente
+    return None
+
+
+def controlla_username(db, username):
     username = normalizza_username(username)
     if not re.fullmatch(r"[a-z0-9_]{3,20}", username):
         raise ErroreGestione("Lo username deve avere da 3 a 20 caratteri (lettere senza accenti, numeri o _).")
-    if conn.execute("SELECT 1 FROM utenti WHERE lower(username) = ?", (username,)).fetchone():
+    if cerca_utente(db, username) is not None:
         raise ErroreGestione(f"Lo username '{username}' è già in uso.")
     return username
 
@@ -191,11 +206,11 @@ def controlla_nome(nome):
     return nome
 
 
-def controlla_email(conn, email):
+def controlla_email(db, email):
     email = (email or "").strip().lower()
     if len(email) > 100 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         raise ErroreGestione("Indirizzo email non valido (esempio: nome@dominio.it).")
-    if conn.execute("SELECT 1 FROM utenti WHERE lower(email) = ?", (email,)).fetchone():
+    if any(utente["email"] == email for utente in db.elenco("utenti")):
         raise ErroreGestione("Esiste già un account registrato con questa email.")
     return email
 
@@ -217,7 +232,7 @@ def valida_password(password, username=""):
 # Registrazione e login
 # ---------------------------------------------------------------------------
 
-def registra_utente(conn, username, nome, email, password, ruolo="partecipante"):
+def registra_utente(db, username, nome, email, password, ruolo="partecipante"):
     """
     Registra un nuovo utente e ne restituisce l'id.
     Dal menu pubblico si possono registrare solo partecipanti;
@@ -225,22 +240,20 @@ def registra_utente(conn, username, nome, email, password, ruolo="partecipante")
     """
     if ruolo not in RUOLI:
         raise ErroreGestione("Ruolo non valido.")
-    username = controlla_username(conn, username)
+    username = controlla_username(db, username)
     nome = controlla_nome(nome)
-    email = controlla_email(conn, email)
+    email = controlla_email(db, email)
     valida_password(password, username)
 
     hash_pw, salt = calcola_hash_password(password)
-    try:
-        with conn:  # transazione: salva tutto o niente
-            cur = conn.execute(
-                "INSERT INTO utenti (username, nome, email, password_hash, salt, ruolo) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (username, nome, email, hash_pw, salt, ruolo))
-    except sqlite3.IntegrityError:
-        # caso raro: lo stesso username è stato registrato nello stesso istante
-        raise ErroreGestione(f"Lo username '{username}' è già in uso.")
-    return cur.lastrowid
+    utente = db.inserisci("utenti", {
+        "username": username, "nome": nome, "email": email,
+        "password_hash": hash_pw,   # hash della password, MAI la password in chiaro
+        "salt": salt,               # valore casuale usato per l'hash
+        "ruolo": ruolo,
+    })
+    db.salva()
+    return utente["id"]
 
 
 # Hash "finto" usato quando lo username non esiste: così il login impiega
@@ -249,57 +262,54 @@ _SALT_FINTO = os.urandom(16).hex()
 _HASH_FINTO, _ = calcola_hash_password("password-inesistente", _SALT_FINTO)
 
 
-def login(conn, username, password):
+def login(db, username, password):
     """
     Verifica le credenziali. Restituisce un dizionario con i dati dell'utente
     (id, username, nome, ruolo, password_predefinita) oppure solleva ErroreGestione.
     """
     username = normalizza_username(username)
-    riga = conn.execute("SELECT * FROM utenti WHERE lower(username) = ?", (username,)).fetchone()
-    if riga is None:
+    utente = cerca_utente(db, username)
+    if utente is None:
         verifica_password(password or "", _HASH_FINTO, _SALT_FINTO)  # stesso tempo di calcolo
         raise ErroreGestione("Username o password errati.")
     # Stesso messaggio per username o password errati: non si rivela quale dei due è sbagliato
-    if not verifica_password(password or "", riga["password_hash"], riga["salt"]):
+    if not verifica_password(password or "", utente["password_hash"], utente["salt"]):
         raise ErroreGestione("Username o password errati.")
     d = ORGANIZZATORE_PREDEFINITO
-    return {"id": riga["id"], "username": riga["username"],
-            "nome": riga["nome"], "ruolo": riga["ruolo"],
+    return {"id": utente["id"], "username": utente["username"],
+            "nome": utente["nome"], "ruolo": utente["ruolo"],
             "password_predefinita": username == d["username"] and password == d["password"]}
 
 
-def cambia_password(conn, utente, vecchia_password, nuova_password):
+def cambia_password(db, utente, vecchia_password, nuova_password):
     """Permette all'utente autenticato di cambiare la propria password."""
-    riga = conn.execute("SELECT * FROM utenti WHERE id = ?", (utente["id"],)).fetchone()
-    if not verifica_password(vecchia_password or "", riga["password_hash"], riga["salt"]):
+    registrato = db.trova("utenti", utente["id"])
+    if not verifica_password(vecchia_password or "", registrato["password_hash"], registrato["salt"]):
         raise ErroreGestione("La password attuale non è corretta.")
     if nuova_password == vecchia_password:
         raise ErroreGestione("La nuova password deve essere diversa da quella attuale.")
-    valida_password(nuova_password, riga["username"])
-    hash_pw, salt = calcola_hash_password(nuova_password)
-    with conn:
-        conn.execute("UPDATE utenti SET password_hash = ?, salt = ? WHERE id = ?",
-                     (hash_pw, salt, utente["id"]))
+    valida_password(nuova_password, registrato["username"])
+    registrato["password_hash"], registrato["salt"] = calcola_hash_password(nuova_password)
+    db.salva()
     utente["password_predefinita"] = False
 
 
-def crea_collaboratore(conn, utente, username, nome, email, password):
+def crea_collaboratore(db, utente, username, nome, email, password):
     """Solo l'organizzatore può creare account di tipo collaboratore."""
     richiedi_ruolo(utente, "organizzatore")
-    return registra_utente(conn, username, nome, email, password, ruolo="collaboratore")
+    return registra_utente(db, username, nome, email, password, ruolo="collaboratore")
 
 
-def crea_organizzatore_predefinito(conn):
+def crea_organizzatore_predefinito(db):
     """
     Al primo avvio non esiste nessun organizzatore: ne viene creato uno
     predefinito, così è possibile accedere e creare gli eventi.
     Restituisce True se l'account è stato creato ora.
     """
-    esiste = conn.execute("SELECT 1 FROM utenti WHERE ruolo = 'organizzatore'").fetchone()
-    if esiste:
+    if any(u["ruolo"] == "organizzatore" for u in db.elenco("utenti")):
         return False
     d = ORGANIZZATORE_PREDEFINITO
-    registra_utente(conn, d["username"], d["nome"], d["email"], d["password"], "organizzatore")
+    registra_utente(db, d["username"], d["nome"], d["email"], d["password"], "organizzatore")
     return True
 
 
@@ -316,9 +326,14 @@ def richiedi_ruolo(utente, *ruoli_ammessi):
 # ===========================================================================
 # 3. EVENTI: creazione, posti disponibili, annullamento e notifiche
 # ===========================================================================
+#
+# Tipologie di evento:
+# - concerto : posti numerati (da 1 a capienza), a pagamento o gratuito
+# - workshop : capienza massima, prenotazioni da approvare
+# - dj_set   : sempre gratuito, prenotazioni confermate automaticamente
 
 TIPI_EVENTO = {"concerto": "Concerto", "workshop": "Workshop", "dj_set": "DJ set"}
-FORMATO_DB = "%Y-%m-%d %H:%M"          # come la data viene salvata nel database
+FORMATO_DATI = "%Y-%m-%d %H:%M"        # come la data viene salvata nel file
 FORMATO_UTENTE = "%d/%m/%Y %H:%M"      # come la data viene scritta/letta dall'utente
 CAPIENZA_MASSIMA = 10_000
 
@@ -328,32 +343,32 @@ CAPIENZA_MASSIMA = 10_000
 # ---------------------------------------------------------------------------
 
 def converti_data(testo):
-    """Converte 'GG/MM/AAAA HH:MM' nel formato del database. Solleva errore se non valida."""
+    """Converte 'GG/MM/AAAA HH:MM' nel formato del file. Solleva errore se non valida."""
     try:
         data = datetime.strptime((testo or "").strip(), FORMATO_UTENTE)
     except ValueError:
         raise ErroreGestione("Data non valida. Usa il formato GG/MM/AAAA HH:MM (es. 15/03/2027 21:00).")
-    return data.strftime(FORMATO_DB)
+    return data.strftime(FORMATO_DATI)
 
 
-def formatta_data(data_db):
-    """Converte la data del database nel formato leggibile dall'utente."""
-    return datetime.strptime(data_db, FORMATO_DB).strftime(FORMATO_UTENTE)
+def formatta_data(data_salvata):
+    """Converte la data salvata nel formato leggibile dall'utente."""
+    return datetime.strptime(data_salvata, FORMATO_DATI).strftime(FORMATO_UTENTE)
 
 
 def evento_passato(evento):
-    return datetime.strptime(evento["data_ora"], FORMATO_DB) < datetime.now()
+    return datetime.strptime(evento["data_ora"], FORMATO_DATI) < datetime.now()
 
 
 # ---------------------------------------------------------------------------
 # Creazione e lettura degli eventi
 # ---------------------------------------------------------------------------
 
-def crea_evento(conn, utente, nome, tipo, data_ora, luogo, capienza, prezzo=0.0, descrizione=""):
+def crea_evento(db, utente, nome, tipo, data_ora, luogo, capienza, prezzo=0.0, descrizione=""):
     """
     Crea un nuovo evento (solo organizzatore) e ne restituisce l'id.
     data_ora deve essere nel formato 'GG/MM/AAAA HH:MM'.
-    Per i concerti vengono creati automaticamente i posti numerati 1..capienza.
+    Per i concerti i posti sono numerati da 1 a capienza.
     """
     richiedi_ruolo(utente, "organizzatore")
 
@@ -366,8 +381,8 @@ def crea_evento(conn, utente, nome, tipo, data_ora, luogo, capienza, prezzo=0.0,
         raise ErroreGestione("Il luogo non può essere vuoto.")
     if tipo not in TIPI_EVENTO:
         raise ErroreGestione("Tipo di evento non valido (concerto, workshop o dj_set).")
-    data_db = converti_data(data_ora)
-    if datetime.strptime(data_db, FORMATO_DB) < datetime.now():
+    data_salvata = converti_data(data_ora)
+    if datetime.strptime(data_salvata, FORMATO_DATI) < datetime.now():
         raise ErroreGestione("Non è possibile creare un evento con una data già passata.")
     if not isinstance(capienza, int) or not 1 <= capienza <= CAPIENZA_MASSIMA:
         raise ErroreGestione(f"La capienza deve essere un numero intero tra 1 e {CAPIENZA_MASSIMA}.")
@@ -380,60 +395,54 @@ def crea_evento(conn, utente, nome, tipo, data_ora, luogo, capienza, prezzo=0.0,
     if tipo == "dj_set":
         prezzo = 0.0  # regola: il DJ set è sempre gratuito
 
-    with conn:  # transazione: evento e posti vengono salvati insieme
-        cur = conn.execute(
-            "INSERT INTO eventi (nome, tipo, data_ora, luogo, descrizione, capienza, prezzo, creato_da) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (nome, tipo, data_db, luogo, (descrizione or "").strip(), capienza, prezzo, utente["id"]))
-        evento_id = cur.lastrowid
-        if tipo == "concerto":
-            conn.executemany("INSERT INTO posti (evento_id, numero) VALUES (?, ?)",
-                             [(evento_id, n) for n in range(1, capienza + 1)])
-    return evento_id
+    evento = db.inserisci("eventi", {
+        "nome": nome, "tipo": tipo, "data_ora": data_salvata, "luogo": luogo,
+        "descrizione": (descrizione or "").strip(), "capienza": capienza,
+        "prezzo": prezzo, "stato": "attivo", "creato_da": utente["id"],
+    })
+    db.salva()
+    return evento["id"]
 
 
-def ottieni_evento(conn, evento_id):
-    """Restituisce la riga dell'evento oppure solleva un errore se non esiste."""
-    evento = conn.execute("SELECT * FROM eventi WHERE id = ?", (evento_id,)).fetchone()
+def ottieni_evento(db, evento_id):
+    """Restituisce l'evento oppure solleva un errore se non esiste."""
+    evento = db.trova("eventi", evento_id)
     if evento is None:
         raise ErroreGestione(f"Nessun evento con id {evento_id}.")
     return evento
 
 
-def posti_occupati(conn, evento_id):
-    """Numero di posti occupati: conta solo le prenotazioni confermate."""
-    riga = conn.execute(
-        "SELECT COALESCE(SUM(num_posti), 0) FROM prenotazioni "
-        "WHERE evento_id = ? AND stato = 'confermata'", (evento_id,)).fetchone()
-    return riga[0]
+def prenotazioni_confermate(db, evento_id):
+    return [p for p in db.elenco("prenotazioni")
+            if p["evento_id"] == evento_id and p["stato"] == "confermata"]
 
 
-def posti_disponibili(conn, evento_id):
-    """Numero di posti ancora prenotabili per un evento."""
-    evento = ottieni_evento(conn, evento_id)
-    if evento["tipo"] == "concerto":
-        return len(posti_liberi_concerto(conn, evento_id))
-    return evento["capienza"] - posti_occupati(conn, evento_id)
+def posti_occupati(db, evento_id):
+    """Numero di posti occupati: contano solo le prenotazioni confermate."""
+    return sum(p["num_posti"] for p in prenotazioni_confermate(db, evento_id))
 
 
-def posti_liberi_concerto(conn, evento_id):
+def posti_liberi_concerto(db, evento_id):
     """Elenco dei numeri di posto ancora liberi di un concerto."""
-    righe = conn.execute(
-        "SELECT numero FROM posti WHERE evento_id = ? AND prenotazione_id IS NULL ORDER BY numero",
-        (evento_id,)).fetchall()
-    return [r["numero"] for r in righe]
+    evento = ottieni_evento(db, evento_id)
+    occupati = {n for p in prenotazioni_confermate(db, evento_id) for n in p["posti"]}
+    return [n for n in range(1, evento["capienza"] + 1) if n not in occupati]
 
 
-def elenca_eventi(conn, includi_annullati=False):
+def posti_disponibili(db, evento_id):
+    """Numero di posti ancora prenotabili per un evento."""
+    evento = ottieni_evento(db, evento_id)
+    return evento["capienza"] - posti_occupati(db, evento_id)
+
+
+def elenca_eventi(db, includi_annullati=False):
     """Restituisce gli eventi ordinati per data, con i posti disponibili calcolati."""
-    sql = "SELECT * FROM eventi"
-    if not includi_annullati:
-        sql += " WHERE stato = 'attivo'"
-    sql += " ORDER BY data_ora"
     risultato = []
-    for evento in conn.execute(sql).fetchall():
-        dati = dict(evento)
-        dati["disponibili"] = posti_disponibili(conn, evento["id"])
+    for evento in sorted(db.elenco("eventi"), key=lambda e: e["data_ora"]):
+        if evento["stato"] == "annullato" and not includi_annullati:
+            continue
+        dati = dict(evento)   # copia, per non modificare i dati salvati
+        dati["disponibili"] = posti_disponibili(db, evento["id"])
         risultato.append(dati)
     return risultato
 
@@ -457,60 +466,65 @@ def formatta_intervalli(numeri):
 # Annullamento evento e notifiche simulate
 # ---------------------------------------------------------------------------
 
-def annulla_evento(conn, utente, evento_id):
+def annulla_evento(db, utente, evento_id):
     """
     Annulla un evento (solo organizzatore):
     - l'evento passa allo stato 'annullato';
-    - tutte le prenotazioni attive vengono annullate e i posti liberati;
+    - tutte le prenotazioni attive vengono annullate (i posti si liberano);
     - i pagamenti già effettuati diventano 'da_rimborsare';
     - ogni partecipante interessato riceve una notifica simulata.
-    Restituisce l'elenco delle notifiche inviate (username, messaggio).
+    Restituisce l'elenco delle notifiche inviate (username, email, messaggio).
     """
     richiedi_ruolo(utente, "organizzatore")
-    evento = ottieni_evento(conn, evento_id)
+    evento = ottieni_evento(db, evento_id)
     if evento["stato"] == "annullato":
         raise ErroreGestione("L'evento è già stato annullato.")
 
-    # Partecipanti con almeno una prenotazione attiva (in attesa o confermata)
-    interessati = conn.execute(
-        "SELECT DISTINCT u.id, u.username, u.nome, u.email FROM prenotazioni p "
-        "JOIN utenti u ON u.id = p.utente_id "
-        "WHERE p.evento_id = ? AND p.stato IN ('in_attesa', 'confermata')",
-        (evento_id,)).fetchall()
-
-    adesso = datetime.now().strftime(FORMATO_DB)
     messaggio = (f"L'evento '{evento['nome']}' del {formatta_data(evento['data_ora'])} "
                  f"presso {evento['luogo']} è stato annullato. "
                  f"Le tue prenotazioni sono state annullate; eventuali pagamenti saranno rimborsati.")
-    inviate = []
+    adesso = datetime.now().strftime(FORMATO_DATI)
 
-    with conn:
-        conn.execute("UPDATE eventi SET stato = 'annullato' WHERE id = ?", (evento_id,))
-        conn.execute(
-            "UPDATE prenotazioni SET stato_pagamento = 'da_rimborsare' "
-            "WHERE evento_id = ? AND stato IN ('in_attesa', 'confermata') AND stato_pagamento = 'pagato'",
-            (evento_id,))
-        conn.execute(
-            "UPDATE prenotazioni SET stato = 'annullata' "
-            "WHERE evento_id = ? AND stato IN ('in_attesa', 'confermata')", (evento_id,))
-        conn.execute("UPDATE posti SET prenotazione_id = NULL WHERE evento_id = ?", (evento_id,))
-        for p in interessati:
-            conn.execute(
-                "INSERT INTO notifiche (utente_id, evento_id, messaggio, data_invio) VALUES (?, ?, ?, ?)",
-                (p["id"], evento_id, messaggio, adesso))
-            inviate.append((p["username"], p["email"], messaggio))
+    evento["stato"] = "annullato"
+    interessati = []   # id dei partecipanti con almeno una prenotazione attiva
+    for p in db.elenco("prenotazioni"):
+        if p["evento_id"] == evento_id and p["stato"] in ("in_attesa", "confermata"):
+            p["stato"] = "annullata"
+            if p["stato_pagamento"] == "pagato":
+                p["stato_pagamento"] = "da_rimborsare"
+            if p["utente_id"] not in interessati:
+                interessati.append(p["utente_id"])
+
+    inviate = []
+    for utente_id in interessati:   # una sola notifica per partecipante
+        destinatario = db.trova("utenti", utente_id)
+        db.inserisci("notifiche", {"utente_id": utente_id, "evento_id": evento_id,
+                                   "messaggio": messaggio, "data_invio": adesso})
+        inviate.append((destinatario["username"], destinatario["email"], messaggio))
+    db.salva()
     return inviate
 
 
-def notifiche_utente(conn, utente):
+def notifiche_utente(db, utente):
     """Notifiche ricevute dall'utente autenticato (dalla più recente)."""
-    return conn.execute(
-        "SELECT * FROM notifiche WHERE utente_id = ? ORDER BY id DESC", (utente["id"],)).fetchall()
+    return [n for n in reversed(db.elenco("notifiche")) if n["utente_id"] == utente["id"]]
 
 
 # ===========================================================================
 # 4. PRENOTAZIONI: prenotazioni, workshop e pagamenti
 # ===========================================================================
+#
+# Stati di una prenotazione:
+#     in_attesa  -> solo workshop, in attesa dell'approvazione dell'organizzatore
+#     confermata -> posti assegnati
+#     rifiutata  -> richiesta di workshop rifiutata
+#     annullata  -> annullata dall'utente, dallo staff o per annullamento dell'evento
+#
+# Stati del pagamento:
+#     gratuito, non_pagato, pagato, da_rimborsare, rimborsato
+#
+# Un posto è occupato solo se appartiene a una prenotazione "confermata":
+# quando una prenotazione viene annullata, i suoi posti tornano liberi da soli.
 
 STATI_PAGAMENTO_MODIFICABILI = ("non_pagato", "pagato", "da_rimborsare", "rimborsato")
 STAFF = ("organizzatore", "collaboratore")
@@ -520,9 +534,9 @@ STAFF = ("organizzatore", "collaboratore")
 # Funzioni di supporto
 # ---------------------------------------------------------------------------
 
-def _controlla_evento_prenotabile(conn, evento_id):
+def _controlla_evento_prenotabile(db, evento_id):
     """Verifica che l'evento esista, sia attivo e non sia già passato."""
-    evento = ottieni_evento(conn, evento_id)
+    evento = ottieni_evento(db, evento_id)
     if evento["stato"] != "attivo":
         raise ErroreGestione("L'evento è stato annullato: non è possibile prenotare.")
     if evento_passato(evento):
@@ -530,45 +544,42 @@ def _controlla_evento_prenotabile(conn, evento_id):
     return evento
 
 
-def _stato_pagamento_iniziale(importo):
-    return "gratuito" if importo == 0 else "non_pagato"
+def _inserisci_prenotazione(db, utente_id, evento_id, num_posti, stato, importo, posti=None):
+    prenotazione = db.inserisci("prenotazioni", {
+        "utente_id": utente_id, "evento_id": evento_id, "num_posti": num_posti,
+        "posti": posti or [],          # numeri dei posti (solo concerti)
+        "stato": stato, "importo": importo,
+        "stato_pagamento": "gratuito" if importo == 0 else "non_pagato",
+        "data_prenotazione": datetime.now().strftime(FORMATO_DATI),
+    })
+    db.salva()
+    return prenotazione["id"]
 
 
-def _inserisci_prenotazione(conn, utente_id, evento_id, num_posti, stato, importo):
-    cur = conn.execute(
-        "INSERT INTO prenotazioni (utente_id, evento_id, num_posti, stato, importo, "
-        "stato_pagamento, data_prenotazione) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (utente_id, evento_id, num_posti, stato, importo,
-         _stato_pagamento_iniziale(importo), datetime.now().strftime(FORMATO_DB)))
-    return cur.lastrowid
-
-
-def ottieni_prenotazione(conn, prenotazione_id):
-    p = conn.execute("SELECT * FROM prenotazioni WHERE id = ?", (prenotazione_id,)).fetchone()
+def ottieni_prenotazione(db, prenotazione_id):
+    p = db.trova("prenotazioni", prenotazione_id)
     if p is None:
         raise ErroreGestione(f"Nessuna prenotazione con id {prenotazione_id}.")
     return p
 
 
-def numeri_posti_prenotazione(conn, prenotazione_id):
-    """Numeri dei posti (concerti) assegnati a una prenotazione."""
-    righe = conn.execute("SELECT numero FROM posti WHERE prenotazione_id = ? ORDER BY numero",
-                         (prenotazione_id,)).fetchall()
-    return [r["numero"] for r in righe]
+def numeri_posti_prenotazione(db, prenotazione_id):
+    """Numeri dei posti (concerti) di una prenotazione."""
+    return ottieni_prenotazione(db, prenotazione_id)["posti"]
 
 
 # ---------------------------------------------------------------------------
 # Prenotazione
 # ---------------------------------------------------------------------------
 
-def prenota_concerto(conn, utente, evento_id, numeri_posti):
+def prenota_concerto(db, utente, evento_id, numeri_posti):
     """
     Prenota uno o più posti numerati di un concerto.
-    Se anche un solo posto non è disponibile, non viene prenotato nulla.
-    Restituisce l'id della prenotazione (confermata).
+    Prima controlla TUTTI i posti richiesti: se anche uno solo non è
+    disponibile, non viene prenotato nulla. Restituisce l'id della prenotazione.
     """
     richiedi_ruolo(utente, "partecipante")
-    evento = _controlla_evento_prenotabile(conn, evento_id)
+    evento = _controlla_evento_prenotabile(db, evento_id)
     if evento["tipo"] != "concerto":
         raise ErroreGestione("Questo evento non ha posti numerati.")
 
@@ -578,23 +589,17 @@ def prenota_concerto(conn, utente, evento_id, numeri_posti):
     for n in numeri:
         if not 1 <= n <= evento["capienza"]:
             raise ErroreGestione(f"Il posto {n} non esiste (posti da 1 a {evento['capienza']}).")
+    liberi = set(posti_liberi_concerto(db, evento_id))
+    occupati = [n for n in numeri if n not in liberi]
+    if occupati:
+        elenco = ", ".join(map(str, occupati))
+        raise ErroreGestione(f"Posti già occupati: {elenco}. Nessun posto è stato prenotato.")
 
     importo = round(evento["prezzo"] * len(numeri), 2)
-    with conn:  # transazione: in caso di errore viene annullato tutto (rollback)
-        prenotazione_id = _inserisci_prenotazione(conn, utente["id"], evento_id,
-                                                  len(numeri), "confermata", importo)
-        for n in numeri:
-            # Il posto viene assegnato solo se è ancora libero (prenotazione_id IS NULL)
-            cur = conn.execute(
-                "UPDATE posti SET prenotazione_id = ? "
-                "WHERE evento_id = ? AND numero = ? AND prenotazione_id IS NULL",
-                (prenotazione_id, evento_id, n))
-            if cur.rowcount == 0:
-                raise ErroreGestione(f"Il posto {n} è già occupato. Nessun posto è stato prenotato.")
-    return prenotazione_id
+    return _inserisci_prenotazione(db, utente["id"], evento_id, len(numeri), "confermata", importo, numeri)
 
 
-def prenota_posti(conn, utente, evento_id, num_posti):
+def prenota_posti(db, utente, evento_id, num_posti):
     """
     Prenota un certo numero di posti per un workshop o un DJ set.
     - Workshop: la prenotazione resta 'in_attesa' finché l'organizzatore non la approva.
@@ -602,63 +607,59 @@ def prenota_posti(conn, utente, evento_id, num_posti):
     Restituisce l'id della prenotazione.
     """
     richiedi_ruolo(utente, "partecipante")
-    evento = _controlla_evento_prenotabile(conn, evento_id)
+    evento = _controlla_evento_prenotabile(db, evento_id)
     if evento["tipo"] == "concerto":
         raise ErroreGestione("Per i concerti bisogna scegliere i posti numerati.")
     if not isinstance(num_posti, int) or num_posti < 1:
         raise ErroreGestione("Il numero di posti deve essere almeno 1.")
 
-    liberi = posti_disponibili(conn, evento_id)
+    liberi = posti_disponibili(db, evento_id)
     if num_posti > liberi:
         raise ErroreGestione(f"Posti insufficienti: richiesti {num_posti}, disponibili {liberi}.")
 
     stato = "in_attesa" if evento["tipo"] == "workshop" else "confermata"
     importo = round(evento["prezzo"] * num_posti, 2)
-    with conn:
-        return _inserisci_prenotazione(conn, utente["id"], evento_id, num_posti, stato, importo)
+    return _inserisci_prenotazione(db, utente["id"], evento_id, num_posti, stato, importo)
 
 
 # ---------------------------------------------------------------------------
 # Consultazione
 # ---------------------------------------------------------------------------
 
-SQL_PRENOTAZIONI = """
-    SELECT p.*, e.nome AS nome_evento, e.tipo AS tipo_evento, e.data_ora, e.stato AS stato_evento,
-           u.username
-    FROM prenotazioni p
-    JOIN eventi e ON e.id = p.evento_id
-    JOIN utenti u ON u.id = p.utente_id
-"""
+def _con_dettagli(db, p):
+    """Copia della prenotazione con i dati dell'evento e dello username (per la stampa)."""
+    evento = db.trova("eventi", p["evento_id"])
+    utente = db.trova("utenti", p["utente_id"])
+    return {**p, "nome_evento": evento["nome"], "tipo_evento": evento["tipo"],
+            "data_ora": evento["data_ora"], "stato_evento": evento["stato"],
+            "username": utente["username"]}
 
 
-def elenca_prenotazioni_utente(conn, utente):
+def elenca_prenotazioni_utente(db, utente):
     """Prenotazioni dell'utente autenticato (un partecipante vede SOLO le proprie)."""
-    return conn.execute(SQL_PRENOTAZIONI + " WHERE p.utente_id = ? ORDER BY p.id",
-                        (utente["id"],)).fetchall()
+    return [_con_dettagli(db, p) for p in db.elenco("prenotazioni") if p["utente_id"] == utente["id"]]
 
 
-def elenca_tutte_prenotazioni(conn, utente, evento_id=None):
+def elenca_tutte_prenotazioni(db, utente, evento_id=None):
     """Tutte le prenotazioni (eventualmente di un solo evento): solo organizzatore e collaboratore."""
     richiedi_ruolo(utente, *STAFF)
-    if evento_id is None:
-        return conn.execute(SQL_PRENOTAZIONI + " ORDER BY p.id").fetchall()
-    return conn.execute(SQL_PRENOTAZIONI + " WHERE p.evento_id = ? ORDER BY p.id",
-                        (evento_id,)).fetchall()
+    return [_con_dettagli(db, p) for p in db.elenco("prenotazioni")
+            if evento_id is None or p["evento_id"] == evento_id]
 
 
 # ---------------------------------------------------------------------------
 # Annullamento di una prenotazione
 # ---------------------------------------------------------------------------
 
-def annulla_prenotazione(conn, utente, prenotazione_id):
+def annulla_prenotazione(db, utente, prenotazione_id):
     """
-    Annulla una prenotazione in attesa o confermata e libera i posti.
+    Annulla una prenotazione in attesa o confermata (i posti tornano liberi).
     Un partecipante può annullare solo le proprie prenotazioni;
     organizzatore e collaboratore possono annullare qualsiasi prenotazione.
     Se era già stata pagata, il pagamento diventa 'da_rimborsare'.
     """
     richiedi_ruolo(utente, "partecipante", *STAFF)
-    p = ottieni_prenotazione(conn, prenotazione_id)
+    p = ottieni_prenotazione(db, prenotazione_id)
 
     if utente["ruolo"] == "partecipante" and p["utente_id"] != utente["id"]:
         # Stesso messaggio di "non esiste": non si rivelano le prenotazioni altrui
@@ -666,28 +667,26 @@ def annulla_prenotazione(conn, utente, prenotazione_id):
     if p["stato"] not in ("in_attesa", "confermata"):
         raise ErroreGestione(f"La prenotazione è già nello stato '{p['stato']}' e non può essere annullata.")
 
-    nuovo_pagamento = "da_rimborsare" if p["stato_pagamento"] == "pagato" else p["stato_pagamento"]
-    with conn:
-        conn.execute("UPDATE prenotazioni SET stato = 'annullata', stato_pagamento = ? WHERE id = ?",
-                     (nuovo_pagamento, prenotazione_id))
-        conn.execute("UPDATE posti SET prenotazione_id = NULL WHERE prenotazione_id = ?",
-                     (prenotazione_id,))
+    p["stato"] = "annullata"
+    if p["stato_pagamento"] == "pagato":
+        p["stato_pagamento"] = "da_rimborsare"
+    db.salva()
 
 
 # ---------------------------------------------------------------------------
 # Approvazione dei workshop (solo organizzatore)
 # ---------------------------------------------------------------------------
 
-def richieste_workshop_in_attesa(conn, utente):
+def richieste_workshop_in_attesa(db, utente):
     richiedi_ruolo(utente, "organizzatore")
-    return conn.execute(SQL_PRENOTAZIONI + " WHERE p.stato = 'in_attesa' AND e.stato = 'attivo' "
-                                           "ORDER BY p.id").fetchall()
+    return [_con_dettagli(db, p) for p in db.elenco("prenotazioni")
+            if p["stato"] == "in_attesa" and db.trova("eventi", p["evento_id"])["stato"] == "attivo"]
 
 
-def _richiesta_workshop(conn, utente, prenotazione_id):
+def _richiesta_workshop(db, utente, prenotazione_id):
     richiedi_ruolo(utente, "organizzatore")
-    p = ottieni_prenotazione(conn, prenotazione_id)
-    evento = ottieni_evento(conn, p["evento_id"])
+    p = ottieni_prenotazione(db, prenotazione_id)
+    evento = ottieni_evento(db, p["evento_id"])
     if evento["tipo"] != "workshop":
         raise ErroreGestione("Solo le prenotazioni dei workshop richiedono approvazione.")
     if p["stato"] != "in_attesa":
@@ -695,42 +694,41 @@ def _richiesta_workshop(conn, utente, prenotazione_id):
     return p, evento
 
 
-def approva_prenotazione(conn, utente, prenotazione_id):
+def approva_prenotazione(db, utente, prenotazione_id):
     """Approva una richiesta di workshop solo se c'è ancora capienza sufficiente."""
-    p, evento = _richiesta_workshop(conn, utente, prenotazione_id)
-    liberi = posti_disponibili(conn, evento["id"])
+    p, evento = _richiesta_workshop(db, utente, prenotazione_id)
+    liberi = posti_disponibili(db, evento["id"])
     if p["num_posti"] > liberi:
         raise ErroreGestione(
             f"Impossibile approvare: la richiesta è di {p['num_posti']} posti "
             f"ma ne restano solo {liberi}. Puoi rifiutarla.")
-    with conn:
-        conn.execute("UPDATE prenotazioni SET stato = 'confermata' WHERE id = ?", (prenotazione_id,))
+    p["stato"] = "confermata"
+    db.salva()
 
 
-def rifiuta_prenotazione(conn, utente, prenotazione_id):
+def rifiuta_prenotazione(db, utente, prenotazione_id):
     """Rifiuta una richiesta di workshop."""
-    _richiesta_workshop(conn, utente, prenotazione_id)
-    with conn:
-        conn.execute("UPDATE prenotazioni SET stato = 'rifiutata' WHERE id = ?", (prenotazione_id,))
+    p, _ = _richiesta_workshop(db, utente, prenotazione_id)
+    p["stato"] = "rifiutata"
+    db.salva()
 
 
 # ---------------------------------------------------------------------------
 # Pagamenti (organizzatore e collaboratore)
 # ---------------------------------------------------------------------------
 
-def aggiorna_pagamento(conn, utente, prenotazione_id, nuovo_stato):
+def aggiorna_pagamento(db, utente, prenotazione_id, nuovo_stato):
     """Aggiorna lo stato del pagamento di una prenotazione (registrazione manuale, non online)."""
     richiedi_ruolo(utente, *STAFF)
     if nuovo_stato not in STATI_PAGAMENTO_MODIFICABILI:
         raise ErroreGestione("Stato di pagamento non valido.")
-    p = ottieni_prenotazione(conn, prenotazione_id)
+    p = ottieni_prenotazione(db, prenotazione_id)
     if p["stato_pagamento"] == "gratuito":
         raise ErroreGestione("La prenotazione è gratuita: non c'è nessun pagamento da gestire.")
     if p["stato"] in ("annullata", "rifiutata") and nuovo_stato == "pagato":
         raise ErroreGestione("Non si può segnare come pagata una prenotazione annullata o rifiutata.")
-    with conn:
-        conn.execute("UPDATE prenotazioni SET stato_pagamento = ? WHERE id = ?",
-                     (nuovo_stato, prenotazione_id))
+    p["stato_pagamento"] = nuovo_stato
+    db.salva()
 
 
 # ===========================================================================
@@ -792,11 +790,11 @@ def chiedi_data(domanda):
     while True:
         testo = chiedi_testo(domanda)
         try:
-            data_db = converti_data(testo)
+            data_salvata = converti_data(testo)
         except ErroreGestione as errore:
             print(f"  ! {errore}")
             continue
-        if datetime.strptime(data_db, FORMATO_DB) < datetime.now():
+        if datetime.strptime(data_salvata, FORMATO_DATI) < datetime.now():
             print("  ! La data è già passata: inserisci una data futura.")
             continue
         return testo
@@ -836,8 +834,8 @@ def conferma(domanda):
 # Stampa di eventi e prenotazioni
 # ---------------------------------------------------------------------------
 
-def stampa_eventi(conn, includi_annullati=False):
-    elenco = elenca_eventi(conn, includi_annullati)
+def stampa_eventi(db, includi_annullati=False):
+    elenco = elenca_eventi(db, includi_annullati)
     if not elenco:
         print("\nNessun evento disponibile.")
         return
@@ -852,7 +850,7 @@ def stampa_eventi(conn, includi_annullati=False):
               f"{e['nome'][:28]:<28} {prezzo:>8} {posti:>13}")
 
 
-def stampa_prenotazioni(conn, elenco, mostra_utente=False):
+def stampa_prenotazioni(db, elenco, mostra_utente=False):
     if not elenco:
         print("\nNessuna prenotazione trovata.")
         return
@@ -860,7 +858,7 @@ def stampa_prenotazioni(conn, elenco, mostra_utente=False):
     for p in elenco:
         dettaglio = f"{p['num_posti']} posto/i"
         if p["tipo_evento"] == "concerto":
-            numeri = numeri_posti_prenotazione(conn, p["id"])
+            numeri = numeri_posti_prenotazione(db, p["id"])
             if numeri:
                 dettaglio = "posti " + formatta_intervalli(numeri)
         utente = f" | utente: {p['username']}" if mostra_utente else ""
@@ -874,13 +872,13 @@ def stampa_prenotazioni(conn, elenco, mostra_utente=False):
 # Azioni comuni
 # ---------------------------------------------------------------------------
 
-def azione_visualizza_eventi(conn, utente):
+def azione_visualizza_eventi(db, utente):
     staff = utente is not None and utente["ruolo"] in STAFF
-    stampa_eventi(conn, includi_annullati=staff)
+    stampa_eventi(db, includi_annullati=staff)
 
 
-def azione_dettagli_evento(conn, utente):
-    evento = ottieni_evento(conn, chiedi_intero("ID dell'evento: "))
+def azione_dettagli_evento(db, utente):
+    evento = ottieni_evento(db, chiedi_intero("ID dell'evento: "))
     print(f"\n=== {evento['nome']} ===")
     print(f"Tipo:        {TIPI_EVENTO[evento['tipo']]}")
     print(f"Data e ora:  {formatta_data(evento['data_ora'])}")
@@ -890,23 +888,23 @@ def azione_dettagli_evento(conn, utente):
     prezzo = "gratuito" if evento["prezzo"] == 0 else f"€{evento['prezzo']:.2f} a posto"
     print(f"Prezzo:      {prezzo}")
     print(f"Stato:       {evento['stato']}")
-    print(f"Capienza:    {evento['capienza']} | disponibili: {posti_disponibili(conn, evento['id'])}")
+    print(f"Capienza:    {evento['capienza']} | disponibili: {posti_disponibili(db, evento['id'])}")
     if evento["tipo"] == "concerto" and evento["stato"] == "attivo":
-        print(f"Posti liberi: {formatta_intervalli(posti_liberi_concerto(conn, evento['id']))}")
+        print(f"Posti liberi: {formatta_intervalli(posti_liberi_concerto(db, evento['id']))}")
     if evento["tipo"] == "workshop":
         print("Nota: le prenotazioni devono essere approvate dall'organizzatore.")
     if utente is not None and utente["ruolo"] in STAFF:
         print("\nPrenotazioni dell'evento:")
-        stampa_prenotazioni(conn, elenca_tutte_prenotazioni(conn, utente, evento["id"]), True)
+        stampa_prenotazioni(db, elenca_tutte_prenotazioni(db, utente, evento["id"]), True)
 
 
-def azione_cambia_password(conn, utente):
+def azione_cambia_password(db, utente):
     vecchia = chiedi_password("Password attuale: ")
     nuova = chiedi_password("Nuova password (min. 6 caratteri, almeno una lettera e un numero): ")
     if nuova != chiedi_password("Ripeti la nuova password: "):
         print("  ! Le password non coincidono.")
         return
-    cambia_password(conn, utente, vecchia, nuova)
+    cambia_password(db, utente, vecchia, nuova)
     print("Password aggiornata.")
 
 
@@ -914,11 +912,11 @@ def azione_cambia_password(conn, utente):
 # Azioni del partecipante
 # ---------------------------------------------------------------------------
 
-def azione_prenota(conn, utente):
-    stampa_eventi(conn)
-    evento = ottieni_evento(conn, chiedi_intero("\nID dell'evento da prenotare: "))
+def azione_prenota(db, utente):
+    stampa_eventi(db)
+    evento = ottieni_evento(db, chiedi_intero("\nID dell'evento da prenotare: "))
     if evento["tipo"] == "concerto":
-        liberi = posti_liberi_concerto(conn, evento["id"])
+        liberi = posti_liberi_concerto(db, evento["id"])
         print(f"Posti liberi: {formatta_intervalli(liberi)}")
         numeri = chiedi_lista_posti("Posti da prenotare (es. 5  oppure  3,4  oppure  10-12): ")
         non_liberi = sorted(set(numeri) - set(liberi))
@@ -928,37 +926,37 @@ def azione_prenota(conn, utente):
         totale = evento["prezzo"] * len(set(numeri))
         if not conferma(f"Confermi {len(set(numeri))} posto/i per un totale di €{totale:.2f}?"):
             return
-        pid = prenota_concerto(conn, utente, evento["id"], numeri)
+        pid = prenota_concerto(db, utente, evento["id"], numeri)
         print(f"Prenotazione #{pid} confermata.")
     else:
-        disponibili = posti_disponibili(conn, evento["id"])
+        disponibili = posti_disponibili(db, evento["id"])
         print(f"Posti disponibili: {disponibili}")
         num = chiedi_intero("Quanti posti vuoi prenotare? ", 1)
-        pid = prenota_posti(conn, utente, evento["id"], num)
+        pid = prenota_posti(db, utente, evento["id"], num)
         if evento["tipo"] == "workshop":
             print(f"Richiesta #{pid} inviata: è in attesa di approvazione dell'organizzatore.")
         else:
             print(f"Prenotazione #{pid} confermata (ingresso gratuito).")
 
 
-def azione_mie_prenotazioni(conn, utente):
-    stampa_prenotazioni(conn, elenca_prenotazioni_utente(conn, utente))
+def azione_mie_prenotazioni(db, utente):
+    stampa_prenotazioni(db, elenca_prenotazioni_utente(db, utente))
 
 
-def azione_annulla_prenotazione(conn, utente):
+def azione_annulla_prenotazione(db, utente):
     if utente["ruolo"] == "partecipante":
-        azione_mie_prenotazioni(conn, utente)
+        azione_mie_prenotazioni(db, utente)
     else:
-        stampa_prenotazioni(conn, elenca_tutte_prenotazioni(conn, utente), True)
+        stampa_prenotazioni(db, elenca_tutte_prenotazioni(db, utente), True)
     pid = chiedi_intero("\nID della prenotazione da annullare (0 = indietro): ", 0)
     if pid == 0 or not conferma(f"Annullare la prenotazione #{pid}?"):
         return
-    annulla_prenotazione(conn, utente, pid)
+    annulla_prenotazione(db, utente, pid)
     print(f"Prenotazione #{pid} annullata. I posti sono di nuovo disponibili.")
 
 
-def azione_mie_notifiche(conn, utente):
-    elenco = notifiche_utente(conn, utente)
+def azione_mie_notifiche(db, utente):
+    elenco = notifiche_utente(db, utente)
     if not elenco:
         print("\nNessuna notifica.")
     for n in elenco:
@@ -969,11 +967,11 @@ def azione_mie_notifiche(conn, utente):
 # Azioni di organizzatore e collaboratore
 # ---------------------------------------------------------------------------
 
-def azione_tutte_prenotazioni(conn, utente):
-    stampa_prenotazioni(conn, elenca_tutte_prenotazioni(conn, utente), True)
+def azione_tutte_prenotazioni(db, utente):
+    stampa_prenotazioni(db, elenca_tutte_prenotazioni(db, utente), True)
 
 
-def azione_crea_evento(conn, utente):
+def azione_crea_evento(db, utente):
     print("\nTipo di evento:  1) Concerto   2) Workshop   3) DJ set")
     tipo = ("concerto", "workshop", "dj_set")[chiedi_intero("Scelta: ", 1, 3) - 1]
     nome = chiedi_testo("Nome evento: ")
@@ -983,34 +981,34 @@ def azione_crea_evento(conn, utente):
     etichetta = "Numero di posti numerati" if tipo == "concerto" else "Capienza massima"
     capienza = chiedi_intero(f"{etichetta}: ", 1, CAPIENZA_MASSIMA)
     prezzo = 0.0 if tipo == "dj_set" else chiedi_decimale("Prezzo a posto in € (0 = gratuito): ")
-    eid = crea_evento(conn, utente, nome, tipo, data, luogo, capienza, prezzo, descrizione)
+    eid = crea_evento(db, utente, nome, tipo, data, luogo, capienza, prezzo, descrizione)
     print(f"Evento #{eid} creato.")
 
 
-def azione_approva_workshop(conn, utente):
-    richieste = richieste_workshop_in_attesa(conn, utente)
+def azione_approva_workshop(db, utente):
+    richieste = richieste_workshop_in_attesa(db, utente)
     if not richieste:
         print("\nNessuna richiesta in attesa.")
         return
     for r in richieste:
         print(f"#{r['id']:<4} {r['nome_evento']} | utente: {r['username']} | posti richiesti: {r['num_posti']} "
-              f"| liberi: {posti_disponibili(conn, r['evento_id'])}")
+              f"| liberi: {posti_disponibili(db, r['evento_id'])}")
     pid = chiedi_intero("\nID della richiesta (0 = indietro): ", 0)
     if pid == 0:
         return
     scelta = chiedi_intero("1) Approva   2) Rifiuta : ", 1, 2)
     if scelta == 1:
-        approva_prenotazione(conn, utente, pid)
+        approva_prenotazione(db, utente, pid)
         print(f"Richiesta #{pid} approvata.")
     else:
-        rifiuta_prenotazione(conn, utente, pid)
+        rifiuta_prenotazione(db, utente, pid)
         print(f"Richiesta #{pid} rifiutata.")
 
 
-def azione_pagamenti(conn, utente):
-    elenco = [p for p in elenca_tutte_prenotazioni(conn, utente)
+def azione_pagamenti(db, utente):
+    elenco = [p for p in elenca_tutte_prenotazioni(db, utente)
               if p["stato_pagamento"] != "gratuito"]
-    stampa_prenotazioni(conn, elenco, True)
+    stampa_prenotazioni(db, elenco, True)
     if not elenco:
         return
     pid = chiedi_intero("\nID della prenotazione da aggiornare (0 = indietro): ", 0)
@@ -1020,31 +1018,31 @@ def azione_pagamenti(conn, utente):
     for i, s in enumerate(stati, 1):
         print(f"  {i}) {ETICHETTE_STATO[s]}")
     nuovo = stati[chiedi_intero("Nuovo stato del pagamento: ", 1, len(stati)) - 1]
-    aggiorna_pagamento(conn, utente, pid, nuovo)
+    aggiorna_pagamento(db, utente, pid, nuovo)
     print(f"Pagamento della prenotazione #{pid} aggiornato a '{ETICHETTE_STATO[nuovo]}'.")
 
 
-def azione_annulla_evento(conn, utente):
-    stampa_eventi(conn)
+def azione_annulla_evento(db, utente):
+    stampa_eventi(db)
     eid = chiedi_intero("\nID dell'evento da annullare (0 = indietro): ", 0)
     if eid == 0:
         return
-    evento = ottieni_evento(conn, eid)
+    evento = ottieni_evento(db, eid)
     if not conferma(f"Annullare definitivamente '{evento['nome']}'?"):
         return
-    inviate = annulla_evento(conn, utente, eid)
+    inviate = annulla_evento(db, utente, eid)
     print(f"Evento '{evento['nome']}' annullato.")
     print(f"Notifiche inviate (simulazione): {len(inviate)}")
     for username, email, messaggio in inviate:
         print(f"  [NOTIFICA -> {username} <{email}>] {messaggio}")
 
 
-def azione_crea_collaboratore(conn, utente):
+def azione_crea_collaboratore(db, utente):
     print("\n--- Nuovo account collaboratore ---")
-    dati = chiedi_dati_account(conn)
+    dati = chiedi_dati_account(db)
     if dati is None:
         return
-    crea_collaboratore(conn, utente, *dati)
+    crea_collaboratore(db, utente, *dati)
     print(f"Collaboratore '{dati[0]}' creato.")
 
 
@@ -1085,15 +1083,15 @@ MENU_PER_RUOLO = {
 }
 
 
-def esegui(azione, conn, utente):
+def esegui(azione, db, utente):
     """Esegue un'azione mostrando in modo chiaro gli eventuali errori."""
     try:
-        azione(conn, utente)
+        azione(db, utente)
     except ErroreGestione as errore:
         print(f"  ! Errore: {errore}")
 
 
-def menu_utente(conn, utente):
+def menu_utente(db, utente):
     """Menu mostrato dopo il login: le voci dipendono dal ruolo."""
     voci = MENU_PER_RUOLO[utente["ruolo"]]
     while True:
@@ -1105,7 +1103,7 @@ def menu_utente(conn, utente):
         if scelta == 0:
             print("Logout effettuato.")
             return
-        esegui(voci[scelta - 1][1], conn, utente)
+        esegui(voci[scelta - 1][1], db, utente)
 
 
 def chiedi_campo(domanda, controllo):
@@ -1121,7 +1119,7 @@ def chiedi_campo(domanda, controllo):
             print(f"  ! {errore}")
 
 
-def chiedi_dati_account(conn):
+def chiedi_dati_account(db):
     """
     Chiede username, nome, email e password controllando ogni campo
     appena inserito. Restituisce (username, nome, email, password),
@@ -1134,12 +1132,12 @@ def chiedi_dati_account(conn):
             print("Operazione annullata.")
             return None
         try:
-            username = controlla_username(conn, username)
+            username = controlla_username(db, username)
             break
         except ErroreGestione as errore:
             print(f"  ! {errore}")
     nome = chiedi_campo("Nome e cognome: ", controlla_nome)
-    email = chiedi_campo("Email: ", lambda e: controlla_email(conn, e))
+    email = chiedi_campo("Email: ", lambda e: controlla_email(db, e))
     while True:
         password = chiedi_password("Password (min. 6 caratteri, almeno una lettera e un numero): ")
         try:
@@ -1152,12 +1150,12 @@ def chiedi_dati_account(conn):
         print("  ! Le password non coincidono, riprova.")
 
 
-def azione_registrazione(conn, _utente=None):
+def azione_registrazione(db, _utente=None):
     print("\n--- Registrazione nuovo partecipante ---")
-    dati = chiedi_dati_account(conn)
+    dati = chiedi_dati_account(db)
     if dati is None:
         return
-    registra_utente(conn, *dati)
+    registra_utente(db, *dati)
     print(f"Registrazione completata. Ora puoi fare il login come '{dati[0]}'.")
 
 
@@ -1165,14 +1163,14 @@ TENTATIVI_PRIMA_DELLA_PAUSA = 3
 SECONDI_DI_PAUSA = 5
 
 
-def azione_login(conn, tentativi_falliti):
+def azione_login(db, tentativi_falliti):
     """
     Esegue il login e restituisce (utente, tentativi_falliti).
     Dopo 3 tentativi sbagliati di fila il programma fa una pausa
     a ogni nuovo errore, per rendere lenti i tentativi "a caso".
     """
     try:
-        utente = login(conn, chiedi_testo("Username: "), chiedi_password())
+        utente = login(db, chiedi_testo("Username: "), chiedi_password())
     except ErroreGestione as errore:
         tentativi_falliti += 1
         print(f"  ! Errore: {errore}")
@@ -1186,7 +1184,7 @@ def azione_login(conn, tentativi_falliti):
     return utente, 0
 
 
-def menu_principale(conn):
+def menu_principale(db):
     tentativi_falliti = 0
     while True:
         print("\n===== GESTIONE EVENTI MUSICALI =====")
@@ -1196,79 +1194,83 @@ def menu_principale(conn):
         print("4. Esci")
         scelta = chiedi_intero("Scelta: ", 1, 4)
         if scelta == 1:
-            esegui(azione_registrazione, conn, None)
+            esegui(azione_registrazione, db, None)
         elif scelta == 2:
-            utente, tentativi_falliti = azione_login(conn, tentativi_falliti)
+            utente, tentativi_falliti = azione_login(db, tentativi_falliti)
             if utente is not None:
-                menu_utente(conn, utente)
+                menu_utente(db, utente)
         elif scelta == 3:
-            stampa_eventi(conn)
+            stampa_eventi(db)
         else:
             print("Arrivederci!")
             return
 
 
 def avvia_programma():
-    """Apre il database (creandolo se serve) e mostra il menu principale."""
-    conn = connetti()
-    if crea_organizzatore_predefinito(conn):
-        print("Primo avvio: creato l'account organizzatore 'admin' (password 'admin123').")
-        print("Cambia la password dopo il primo accesso.")
+    """Apre il file dei dati (creandolo se serve) e mostra il menu principale."""
     try:
-        menu_principale(conn)
+        db = apri_archivio()
+        if crea_organizzatore_predefinito(db):
+            print("Primo avvio: creato il file dei dati e l'account organizzatore "
+                  "'admin' (password 'admin123').")
+            print("Cambia la password dopo il primo accesso.")
+    except ErroreGestione as errore:
+        print(f"  ! Errore: {errore}")
+        print("Il programma si ferma per non sovrascrivere i dati. "
+              "Controlla il file oppure spostalo per ripartire da zero.")
+        return
+    try:
+        menu_principale(db)
     except (KeyboardInterrupt, EOFError):
         print("\nProgramma interrotto.")
-    finally:
-        conn.close()
 
 
 # ===========================================================================
 # 6. DATI DI ESEMPIO (python gestione_eventi.py --dati-esempio)
 # ===========================================================================
 
-def crea_dati_esempio(conn):
+def crea_dati_esempio(db):
     # --- Utenti (le password vengono salvate solo come hash) ---
-    crea_organizzatore_predefinito(conn)                      # admin / admin123
-    admin = login(conn, "admin", "admin123")
-    crea_collaboratore(conn, admin, "staff", "Luca Bianchi", "luca@eventi.local", "staff123")
-    registra_utente(conn, "mario", "Mario Rossi", "mario@email.it", "mario123")
-    registra_utente(conn, "giulia", "Giulia Verdi", "giulia@email.it", "giulia123")
-    mario = login(conn, "mario", "mario123")
-    giulia = login(conn, "giulia", "giulia123")
+    crea_organizzatore_predefinito(db)                      # admin / admin123
+    admin = login(db, "admin", "admin123")
+    crea_collaboratore(db, admin, "staff", "Luca Bianchi", "luca@eventi.local", "staff123")
+    registra_utente(db, "mario", "Mario Rossi", "mario@email.it", "mario123")
+    registra_utente(db, "giulia", "Giulia Verdi", "giulia@email.it", "giulia123")
+    mario = login(db, "mario", "mario123")
+    giulia = login(db, "giulia", "giulia123")
 
     # --- Eventi ---
-    concerto = crea_evento(conn, admin, "Concerto Rock d'Autunno", "concerto",
+    concerto = crea_evento(db, admin, "Concerto Rock d'Autunno", "concerto",
                            "14/11/2027 21:00", "Teatro Comunale", 30, 25.0,
                            "Serata con band emergenti del territorio.")
-    workshop = crea_evento(conn, admin, "Workshop di produzione musicale", "workshop",
+    workshop = crea_evento(db, admin, "Workshop di produzione musicale", "workshop",
                            "20/11/2027 15:00", "Sala prove Musica Viva", 8, 40.0,
                            "Introduzione a DAW, registrazione e mixaggio.")
-    dj_set = crea_evento(conn, admin, "DJ set sotto le stelle", "dj_set",
+    dj_set = crea_evento(db, admin, "DJ set sotto le stelle", "dj_set",
                          "28/11/2027 22:30", "Piazza Maggiore", 100, 0,
                          "Musica elettronica all'aperto, ingresso libero.")
 
     # --- Prenotazioni ---
-    p1 = prenota_concerto(conn, mario, concerto, [5, 6])       # 2 posti numerati
-    prenota_concerto(conn, giulia, concerto, [10])
-    aggiorna_pagamento(conn, admin, p1, "pagato")
-    w1 = prenota_posti(conn, mario, workshop, 1)               # in attesa
-    prenota_posti(conn, giulia, workshop, 2)                   # in attesa
-    approva_prenotazione(conn, admin, w1)
-    prenota_posti(conn, giulia, dj_set, 3)                     # confermata subito
+    p1 = prenota_concerto(db, mario, concerto, [5, 6])       # 2 posti numerati
+    prenota_concerto(db, giulia, concerto, [10])
+    aggiorna_pagamento(db, admin, p1, "pagato")
+    w1 = prenota_posti(db, mario, workshop, 1)               # in attesa
+    prenota_posti(db, giulia, workshop, 2)                   # in attesa
+    approva_prenotazione(db, admin, w1)
+    prenota_posti(db, giulia, dj_set, 3)                     # confermata subito
 
 
 def genera_dati_esempio():
-    """Cancella il database attuale (dopo conferma) e lo ricrea con i dati dimostrativi."""
-    if os.path.exists(PERCORSO_DB):
-        risposta = input("Il database esiste già e verrà cancellato. Continuare? (s/n): ")
+    """Cancella il file dei dati attuale (dopo conferma) e lo ricrea con i dati dimostrativi."""
+    if os.path.exists(PERCORSO_DATI):
+        risposta = input("Il file dei dati esiste già e verrà sostituito. Continuare? (s/n): ")
         if risposta.strip().lower() not in ("s", "si", "sì"):
             print("Operazione annullata.")
             return
-        os.remove(PERCORSO_DB)
-    conn = connetti()
-    crea_dati_esempio(conn)
-    conn.close()
-    print(f"Database con dati di esempio creato: {PERCORSO_DB}")
+        os.remove(PERCORSO_DATI)
+    db = apri_archivio()
+    crea_dati_esempio(db)
+    print(f"File con dati di esempio creato: {PERCORSO_DATI}")
     print("Account: admin/admin123 (organizzatore), staff/staff123 (collaboratore),")
     print("         mario/mario123 e giulia/giulia123 (partecipanti)")
 
@@ -1281,25 +1283,22 @@ DATA_FUTURA = "15/06/2030 21:00"
 
 
 class BaseTest(unittest.TestCase):
-    """Prepara un database vuoto con un organizzatore, un collaboratore e due partecipanti."""
+    """Prepara un archivio vuoto (solo in memoria) con organizzatore, collaboratore e due partecipanti."""
 
     def setUp(self):
-        self.conn = connetti(":memory:")
-        crea_organizzatore_predefinito(self.conn)
-        self.org = login(self.conn, "admin", "admin123")
-        crea_collaboratore(self.conn, self.org, "staff", "Staff", "staff@test.it", "staff123")
-        self.collab = login(self.conn, "staff", "staff123")
-        registra_utente(self.conn, "anna", "Anna", "anna@test.it", "anna123")
-        registra_utente(self.conn, "bruno", "Bruno", "bruno@test.it", "bruno123")
-        self.anna = login(self.conn, "anna", "anna123")
-        self.bruno = login(self.conn, "bruno", "bruno123")
-
-    def tearDown(self):
-        self.conn.close()
+        self.db = apri_archivio(None)
+        crea_organizzatore_predefinito(self.db)
+        self.org = login(self.db, "admin", "admin123")
+        crea_collaboratore(self.db, self.org, "staff", "Staff", "staff@test.it", "staff123")
+        self.collab = login(self.db, "staff", "staff123")
+        registra_utente(self.db, "anna", "Anna", "anna@test.it", "anna123")
+        registra_utente(self.db, "bruno", "Bruno", "bruno@test.it", "bruno123")
+        self.anna = login(self.db, "anna", "anna123")
+        self.bruno = login(self.db, "bruno", "bruno123")
 
     def nuovo_evento(self, tipo, capienza=5, prezzo=10.0):
-        return crea_evento(self.conn, self.org, f"Evento {tipo}", tipo,
-                                  DATA_FUTURA, "Bologna", capienza, prezzo)
+        return crea_evento(self.db, self.org, f"Evento {tipo}", tipo,
+                           DATA_FUTURA, "Bologna", capienza, prezzo)
 
 
 class TestUtenti(BaseTest):
@@ -1308,21 +1307,20 @@ class TestUtenti(BaseTest):
     def errore(self, funzione, *argomenti):
         """Verifica che l'operazione venga rifiutata e restituisce il messaggio di errore."""
         with self.assertRaises(ErroreGestione) as contesto:
-            funzione(self.conn, *argomenti)
+            funzione(self.db, *argomenti)
         return str(contesto.exception)
 
     # --- password ---
     def test_password_non_salvata_in_chiaro(self):
-        riga = self.conn.execute("SELECT * FROM utenti WHERE username = 'anna'").fetchone()
+        riga = cerca_utente(self.db, "anna")
         self.assertNotEqual(riga["password_hash"], "anna123")
         self.assertNotIn("anna123", riga["password_hash"])
         self.assertEqual(len(riga["salt"]), 32)   # salt casuale di 16 byte
 
     def test_stessa_password_hash_diversi(self):
         """Grazie al salt, due utenti con la stessa password hanno hash diversi."""
-        registra_utente(self.conn, "carla", "Carla", "carla@test.it", "anna123")
-        h1, h2 = (self.conn.execute("SELECT password_hash FROM utenti WHERE username = ?", (u,))
-                  .fetchone()[0] for u in ("anna", "carla"))
+        registra_utente(self.db, "carla", "Carla", "carla@test.it", "anna123")
+        h1, h2 = (cerca_utente(self.db, u)["password_hash"] for u in ("anna", "carla"))
         self.assertNotEqual(h1, h2)
 
     def test_password_deboli_rifiutate(self):
@@ -1334,8 +1332,8 @@ class TestUtenti(BaseTest):
 
     # --- registrazione ---
     def test_registrazione_corretta(self):
-        uid = registra_utente(self.conn, "  Carla_99 ", "  Carla   Rossi ", " Carla@Test.IT ", "carla123")
-        riga = self.conn.execute("SELECT * FROM utenti WHERE id = ?", (uid,)).fetchone()
+        uid = registra_utente(self.db, "  Carla_99 ", "  Carla   Rossi ", " Carla@Test.IT ", "carla123")
+        riga = self.db.trova("utenti", uid)
         self.assertEqual(riga["username"], "carla_99")      # minuscolo e senza spazi
         self.assertEqual(riga["nome"], "Carla Rossi")       # spazi in eccesso tolti
         self.assertEqual(riga["email"], "carla@test.it")
@@ -1365,12 +1363,12 @@ class TestUtenti(BaseTest):
 
     # --- login ---
     def test_login_corretto(self):
-        utente = login(self.conn, "anna", "anna123")
+        utente = login(self.db, "anna", "anna123")
         self.assertEqual((utente["username"], utente["ruolo"]), ("anna", "partecipante"))
         self.assertFalse(utente["password_predefinita"])
 
     def test_login_ignora_maiuscole_e_spazi_nello_username(self):
-        self.assertEqual(login(self.conn, "  ANNA ", "anna123")["username"], "anna")
+        self.assertEqual(login(self.db, "  ANNA ", "anna123")["username"], "anna")
 
     def test_login_password_distingue_maiuscole(self):
         self.errore(login, "anna", "ANNA123")
@@ -1385,45 +1383,45 @@ class TestUtenti(BaseTest):
 
     def test_avviso_password_predefinita(self):
         self.assertTrue(self.org["password_predefinita"])
-        cambia_password(self.conn, self.org, "admin123", "nuovaPw1")
+        cambia_password(self.db, self.org, "admin123", "nuovaPw1")
         self.assertFalse(self.org["password_predefinita"])
         self.errore(login, "admin", "admin123")
-        self.assertFalse(login(self.conn, "admin", "nuovaPw1")["password_predefinita"])
+        self.assertFalse(login(self.db, "admin", "nuovaPw1")["password_predefinita"])
 
     # --- cambio password ---
     def test_cambia_password(self):
         self.errore(cambia_password, self.anna, "sbagliata1", "nuova123")   # vecchia errata
         self.errore(cambia_password, self.anna, "anna123", "anna123")      # uguale alla vecchia
         self.errore(cambia_password, self.anna, "anna123", "corta")        # debole
-        cambia_password(self.conn, self.anna, "anna123", "nuova123")
+        cambia_password(self.db, self.anna, "anna123", "nuova123")
         self.errore(login, "anna", "anna123")
-        login(self.conn, "anna", "nuova123")
+        login(self.db, "anna", "nuova123")
 
 
 class TestCreazioneEventi(BaseTest):
     def test_crea_concerto_con_posti_numerati(self):
         eid = self.nuovo_evento("concerto", capienza=20)
-        self.assertEqual(posti_disponibili(self.conn, eid), 20)
-        self.assertEqual(posti_liberi_concerto(self.conn, eid), list(range(1, 21)))
+        self.assertEqual(posti_disponibili(self.db, eid), 20)
+        self.assertEqual(posti_liberi_concerto(self.db, eid), list(range(1, 21)))
 
     def test_dj_set_sempre_gratuito(self):
         eid = self.nuovo_evento("dj_set", prezzo=15)
-        self.assertEqual(ottieni_evento(self.conn, eid)["prezzo"], 0)
+        self.assertEqual(ottieni_evento(self.db, eid)["prezzo"], 0)
 
     def test_solo_organizzatore_crea_eventi(self):
         for utente in (self.anna, self.collab):
             with self.assertRaises(ErroreGestione):
-                crea_evento(self.conn, utente, "X", "concerto", DATA_FUTURA, "Y", 10)
+                crea_evento(self.db, utente, "X", "concerto", DATA_FUTURA, "Y", 10)
 
     def test_dati_evento_non_validi(self):
         with self.assertRaises(ErroreGestione):
-            crea_evento(self.conn, self.org, "X", "concerto", DATA_FUTURA, "Y", 0)
+            crea_evento(self.db, self.org, "X", "concerto", DATA_FUTURA, "Y", 0)
         with self.assertRaises(ErroreGestione):
-            crea_evento(self.conn, self.org, "X", "festival", DATA_FUTURA, "Y", 10)
+            crea_evento(self.db, self.org, "X", "festival", DATA_FUTURA, "Y", 10)
         with self.assertRaises(ErroreGestione):
-            crea_evento(self.conn, self.org, "X", "concerto", "31/02/2030 20:00", "Y", 10)
+            crea_evento(self.db, self.org, "X", "concerto", "31/02/2030 20:00", "Y", 10)
         with self.assertRaises(ErroreGestione):
-            crea_evento(self.conn, self.org, "X", "concerto", "01/01/2020 20:00", "Y", 10)
+            crea_evento(self.db, self.org, "X", "concerto", "01/01/2020 20:00", "Y", 10)
 
 
 class TestConcerto(BaseTest):
@@ -1432,47 +1430,47 @@ class TestConcerto(BaseTest):
         self.eid = self.nuovo_evento("concerto", capienza=5, prezzo=20)
 
     def test_prenotazione_piu_posti(self):
-        pid = prenota_concerto(self.conn, self.anna, self.eid, [1, 2, 3])
-        p = ottieni_prenotazione(self.conn, pid)
+        pid = prenota_concerto(self.db, self.anna, self.eid, [1, 2, 3])
+        p = ottieni_prenotazione(self.db, pid)
         self.assertEqual(p["stato"], "confermata")
         self.assertEqual(p["importo"], 60)
         self.assertEqual(p["stato_pagamento"], "non_pagato")
-        self.assertEqual(posti_liberi_concerto(self.conn, self.eid), [4, 5])
+        self.assertEqual(posti_liberi_concerto(self.db, self.eid), [4, 5])
 
     def test_stesso_account_prenota_di_nuovo(self):
-        prenota_concerto(self.conn, self.anna, self.eid, [1])
-        prenota_concerto(self.conn, self.anna, self.eid, [2])
-        self.assertEqual(len(elenca_prenotazioni_utente(self.conn, self.anna)), 2)
+        prenota_concerto(self.db, self.anna, self.eid, [1])
+        prenota_concerto(self.db, self.anna, self.eid, [2])
+        self.assertEqual(len(elenca_prenotazioni_utente(self.db, self.anna)), 2)
 
     def test_posto_gia_occupato(self):
-        prenota_concerto(self.conn, self.anna, self.eid, [3])
+        prenota_concerto(self.db, self.anna, self.eid, [3])
         with self.assertRaises(ErroreGestione):
-            prenota_concerto(self.conn, self.bruno, self.eid, [3])
+            prenota_concerto(self.db, self.bruno, self.eid, [3])
 
     def test_tutto_o_niente(self):
         """Se un posto è occupato non deve essere prenotato nemmeno quello libero."""
-        prenota_concerto(self.conn, self.anna, self.eid, [3])
+        prenota_concerto(self.db, self.anna, self.eid, [3])
         with self.assertRaises(ErroreGestione):
-            prenota_concerto(self.conn, self.bruno, self.eid, [2, 3])
-        self.assertIn(2, posti_liberi_concerto(self.conn, self.eid))
-        self.assertEqual(len(elenca_prenotazioni_utente(self.conn, self.bruno)), 0)
+            prenota_concerto(self.db, self.bruno, self.eid, [2, 3])
+        self.assertIn(2, posti_liberi_concerto(self.db, self.eid))
+        self.assertEqual(len(elenca_prenotazioni_utente(self.db, self.bruno)), 0)
 
     def test_posto_inesistente(self):
         with self.assertRaises(ErroreGestione):
-            prenota_concerto(self.conn, self.anna, self.eid, [6])
+            prenota_concerto(self.db, self.anna, self.eid, [6])
 
 
 class TestDjSet(BaseTest):
     def test_conferma_automatica_e_capienza(self):
         eid = self.nuovo_evento("dj_set", capienza=3)
-        pid = prenota_posti(self.conn, self.anna, eid, 2)
-        p = ottieni_prenotazione(self.conn, pid)
+        pid = prenota_posti(self.db, self.anna, eid, 2)
+        p = ottieni_prenotazione(self.db, pid)
         self.assertEqual(p["stato"], "confermata")
         self.assertEqual(p["stato_pagamento"], "gratuito")
         with self.assertRaises(ErroreGestione):
-            prenota_posti(self.conn, self.bruno, eid, 2)     # ne resta solo 1
-        prenota_posti(self.conn, self.bruno, eid, 1)
-        self.assertEqual(posti_disponibili(self.conn, eid), 0)
+            prenota_posti(self.db, self.bruno, eid, 2)     # ne resta solo 1
+        prenota_posti(self.db, self.bruno, eid, 1)
+        self.assertEqual(posti_disponibili(self.db, eid), 0)
 
 
 class TestWorkshop(BaseTest):
@@ -1481,103 +1479,160 @@ class TestWorkshop(BaseTest):
         self.eid = self.nuovo_evento("workshop", capienza=3, prezzo=30)
 
     def test_richiesta_in_attesa(self):
-        pid = prenota_posti(self.conn, self.anna, self.eid, 2)
-        self.assertEqual(ottieni_prenotazione(self.conn, pid)["stato"], "in_attesa")
+        pid = prenota_posti(self.db, self.anna, self.eid, 2)
+        self.assertEqual(ottieni_prenotazione(self.db, pid)["stato"], "in_attesa")
         # finché non è approvata non occupa posti
-        self.assertEqual(posti_disponibili(self.conn, self.eid), 3)
+        self.assertEqual(posti_disponibili(self.db, self.eid), 3)
 
     def test_approvazione_non_supera_capienza(self):
-        p1 = prenota_posti(self.conn, self.anna, self.eid, 2)
-        p2 = prenota_posti(self.conn, self.bruno, self.eid, 2)
-        approva_prenotazione(self.conn, self.org, p1)
+        p1 = prenota_posti(self.db, self.anna, self.eid, 2)
+        p2 = prenota_posti(self.db, self.bruno, self.eid, 2)
+        approva_prenotazione(self.db, self.org, p1)
         with self.assertRaises(ErroreGestione):
-            approva_prenotazione(self.conn, self.org, p2)   # 2 + 2 > 3
-        self.assertEqual(posti_disponibili(self.conn, self.eid), 1)
+            approva_prenotazione(self.db, self.org, p2)   # 2 + 2 > 3
+        self.assertEqual(posti_disponibili(self.db, self.eid), 1)
 
     def test_rifiuto(self):
-        pid = prenota_posti(self.conn, self.anna, self.eid, 1)
-        rifiuta_prenotazione(self.conn, self.org, pid)
-        self.assertEqual(ottieni_prenotazione(self.conn, pid)["stato"], "rifiutata")
+        pid = prenota_posti(self.db, self.anna, self.eid, 1)
+        rifiuta_prenotazione(self.db, self.org, pid)
+        self.assertEqual(ottieni_prenotazione(self.db, pid)["stato"], "rifiutata")
         with self.assertRaises(ErroreGestione):
-            approva_prenotazione(self.conn, self.org, pid)  # non più in attesa
+            approva_prenotazione(self.db, self.org, pid)  # non più in attesa
 
     def test_solo_organizzatore_approva(self):
-        pid = prenota_posti(self.conn, self.anna, self.eid, 1)
+        pid = prenota_posti(self.db, self.anna, self.eid, 1)
         for utente in (self.collab, self.anna):
             with self.assertRaises(ErroreGestione):
-                approva_prenotazione(self.conn, utente, pid)
+                approva_prenotazione(self.db, utente, pid)
 
 
 class TestAnnullamenti(BaseTest):
     def test_annulla_prenotazione_libera_posti(self):
         eid = self.nuovo_evento("concerto", capienza=5)
-        pid = prenota_concerto(self.conn, self.anna, eid, [1, 2])
-        annulla_prenotazione(self.conn, self.anna, pid)
-        self.assertEqual(ottieni_prenotazione(self.conn, pid)["stato"], "annullata")
-        self.assertEqual(posti_disponibili(self.conn, eid), 5)
-        prenota_concerto(self.conn, self.bruno, eid, [1])   # il posto è di nuovo prenotabile
+        pid = prenota_concerto(self.db, self.anna, eid, [1, 2])
+        annulla_prenotazione(self.db, self.anna, pid)
+        self.assertEqual(ottieni_prenotazione(self.db, pid)["stato"], "annullata")
+        self.assertEqual(posti_disponibili(self.db, eid), 5)
+        prenota_concerto(self.db, self.bruno, eid, [1])   # il posto è di nuovo prenotabile
 
     def test_annulla_prenotazione_pagata(self):
         eid = self.nuovo_evento("concerto", capienza=5)
-        pid = prenota_concerto(self.conn, self.anna, eid, [1])
-        aggiorna_pagamento(self.conn, self.collab, pid, "pagato")
-        annulla_prenotazione(self.conn, self.anna, pid)
-        self.assertEqual(ottieni_prenotazione(self.conn, pid)["stato_pagamento"], "da_rimborsare")
+        pid = prenota_concerto(self.db, self.anna, eid, [1])
+        aggiorna_pagamento(self.db, self.collab, pid, "pagato")
+        annulla_prenotazione(self.db, self.anna, pid)
+        self.assertEqual(ottieni_prenotazione(self.db, pid)["stato_pagamento"], "da_rimborsare")
 
     def test_partecipante_non_tocca_prenotazioni_altrui(self):
         eid = self.nuovo_evento("dj_set")
-        pid = prenota_posti(self.conn, self.anna, eid, 1)
+        pid = prenota_posti(self.db, self.anna, eid, 1)
         with self.assertRaises(ErroreGestione):
-            annulla_prenotazione(self.conn, self.bruno, pid)
+            annulla_prenotazione(self.db, self.bruno, pid)
         with self.assertRaises(ErroreGestione):
-            elenca_tutte_prenotazioni(self.conn, self.bruno)
-        self.assertEqual(len(elenca_prenotazioni_utente(self.conn, self.bruno)), 0)
+            elenca_tutte_prenotazioni(self.db, self.bruno)
+        self.assertEqual(len(elenca_prenotazioni_utente(self.db, self.bruno)), 0)
 
     def test_doppio_annullamento(self):
         eid = self.nuovo_evento("dj_set")
-        pid = prenota_posti(self.conn, self.anna, eid, 1)
-        annulla_prenotazione(self.conn, self.anna, pid)
+        pid = prenota_posti(self.db, self.anna, eid, 1)
+        annulla_prenotazione(self.db, self.anna, pid)
         with self.assertRaises(ErroreGestione):
-            annulla_prenotazione(self.conn, self.anna, pid)
+            annulla_prenotazione(self.db, self.anna, pid)
 
     def test_annulla_evento_e_notifiche(self):
         eid = self.nuovo_evento("concerto", capienza=5)
-        pid_anna = prenota_concerto(self.conn, self.anna, eid, [1])
-        prenota_concerto(self.conn, self.anna, eid, [2])
-        prenota_concerto(self.conn, self.bruno, eid, [3])
-        aggiorna_pagamento(self.conn, self.org, pid_anna, "pagato")
+        pid_anna = prenota_concerto(self.db, self.anna, eid, [1])
+        prenota_concerto(self.db, self.anna, eid, [2])
+        prenota_concerto(self.db, self.bruno, eid, [3])
+        aggiorna_pagamento(self.db, self.org, pid_anna, "pagato")
 
-        inviate = annulla_evento(self.conn, self.org, eid)
+        inviate = annulla_evento(self.db, self.org, eid)
 
         self.assertEqual(sorted(n[0] for n in inviate), ["anna", "bruno"])  # una notifica a testa
-        self.assertEqual(len(notifiche_utente(self.conn, self.anna)), 1)
-        self.assertEqual(ottieni_evento(self.conn, eid)["stato"], "annullato")
-        stati = {p["stato"] for p in elenca_tutte_prenotazioni(self.conn, self.org, eid)}
+        self.assertEqual(len(notifiche_utente(self.db, self.anna)), 1)
+        self.assertEqual(ottieni_evento(self.db, eid)["stato"], "annullato")
+        stati = {p["stato"] for p in elenca_tutte_prenotazioni(self.db, self.org, eid)}
         self.assertEqual(stati, {"annullata"})
-        self.assertEqual(ottieni_prenotazione(self.conn, pid_anna)["stato_pagamento"], "da_rimborsare")
+        self.assertEqual(ottieni_prenotazione(self.db, pid_anna)["stato_pagamento"], "da_rimborsare")
         with self.assertRaises(ErroreGestione):
-            prenota_concerto(self.conn, self.bruno, eid, [4])   # evento annullato
+            prenota_concerto(self.db, self.bruno, eid, [4])   # evento annullato
 
     def test_solo_organizzatore_annulla_evento(self):
         eid = self.nuovo_evento("dj_set")
         with self.assertRaises(ErroreGestione):
-            annulla_evento(self.conn, self.collab, eid)
+            annulla_evento(self.db, self.collab, eid)
+
+
+class TestFileJson(unittest.TestCase):
+    """Salvataggio e lettura del file JSON (usa una cartella temporanea)."""
+
+    def setUp(self):
+        self.cartella = tempfile.TemporaryDirectory()
+        self.percorso = os.path.join(self.cartella.name, "dati.json")
+
+    def tearDown(self):
+        self.cartella.cleanup()
+
+    def test_dati_salvati_e_ricaricati(self):
+        db = apri_archivio(self.percorso)
+        crea_organizzatore_predefinito(db)
+        org = login(db, "admin", "admin123")
+        registra_utente(db, "anna", "Anna", "anna@test.it", "anna123")
+        eid = crea_evento(db, org, "Concerto", "concerto", DATA_FUTURA, "Bologna", 5, 10)
+        pid = prenota_concerto(db, login(db, "anna", "anna123"), eid, [2, 3])
+
+        # Si riapre il file da zero, come se il programma fosse stato chiuso e riavviato
+        riaperto = apri_archivio(self.percorso)
+        anna = login(riaperto, "anna", "anna123")
+        self.assertEqual(ottieni_evento(riaperto, eid)["nome"], "Concerto")
+        self.assertEqual(posti_liberi_concerto(riaperto, eid), [1, 4, 5])
+        annulla_prenotazione(riaperto, anna, pid)
+        self.assertEqual(posti_disponibili(apri_archivio(self.percorso), eid), 5)
+
+    def test_file_json_leggibile_e_senza_password_in_chiaro(self):
+        db = apri_archivio(self.percorso)
+        crea_organizzatore_predefinito(db)
+        with open(self.percorso, encoding="utf-8") as file:
+            contenuto = file.read()
+        dati = json.loads(contenuto)   # è JSON valido
+        self.assertEqual(dati["utenti"][0]["username"], "admin")
+        self.assertNotIn("admin123", contenuto)
+
+    def test_id_non_riutilizzati(self):
+        db = apri_archivio(self.percorso)
+        crea_organizzatore_predefinito(db)
+        id1 = registra_utente(db, "anna", "Anna", "anna@test.it", "anna123")
+        id2 = registra_utente(apri_archivio(self.percorso), "bruno", "Bruno", "bruno@test.it", "bruno123")
+        self.assertEqual(id2, id1 + 1)
+
+    def test_file_rovinato_non_viene_sovrascritto(self):
+        with open(self.percorso, "w", encoding="utf-8") as file:
+            file.write("{ questo non è JSON")
+        with self.assertRaises(ErroreGestione):
+            apri_archivio(self.percorso)
+        with open(self.percorso, encoding="utf-8") as file:
+            self.assertEqual(file.read(), "{ questo non è JSON")
+
+    def test_file_con_formato_sbagliato(self):
+        with open(self.percorso, "w", encoding="utf-8") as file:
+            json.dump({"utenti": "non una lista"}, file)
+        with self.assertRaises(ErroreGestione):
+            apri_archivio(self.percorso)
 
 
 class TestPagamenti(BaseTest):
     def test_aggiorna_pagamento(self):
         eid = self.nuovo_evento("workshop", prezzo=30)
-        pid = prenota_posti(self.conn, self.anna, eid, 1)
-        aggiorna_pagamento(self.conn, self.collab, pid, "pagato")
-        self.assertEqual(ottieni_prenotazione(self.conn, pid)["stato_pagamento"], "pagato")
+        pid = prenota_posti(self.db, self.anna, eid, 1)
+        aggiorna_pagamento(self.db, self.collab, pid, "pagato")
+        self.assertEqual(ottieni_prenotazione(self.db, pid)["stato_pagamento"], "pagato")
 
     def test_pagamento_gratuito_non_modificabile_e_permessi(self):
         eid = self.nuovo_evento("dj_set")
-        pid = prenota_posti(self.conn, self.anna, eid, 1)
+        pid = prenota_posti(self.db, self.anna, eid, 1)
         with self.assertRaises(ErroreGestione):
-            aggiorna_pagamento(self.conn, self.org, pid, "pagato")
+            aggiorna_pagamento(self.db, self.org, pid, "pagato")
         with self.assertRaises(ErroreGestione):
-            aggiorna_pagamento(self.conn, self.anna, pid, "pagato")
+            aggiorna_pagamento(self.db, self.anna, pid, "pagato")
 
 
 # ===========================================================================
