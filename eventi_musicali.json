@@ -1,0 +1,22 @@
+{
+  "ultimo_id": {
+    "utenti": 1,
+    "eventi": 0,
+    "prenotazioni": 0,
+    "notifiche": 0
+  },
+  "utenti": [
+    {
+      "id": 1,
+      "username": "admin",
+      "nome": "Organizzatore",
+      "email": "organizzatore@eventi.local",
+      "password_hash": "daff4fe666e577d869b3de7273d3a3f2b6ddb3ddce405ecb7a84df6f1aaaa218",
+      "salt": "769985da1f9ba1d9928ba2b2291162b4",
+      "ruolo": "organizzatore"
+    }
+  ],
+  "eventi": [],
+  "prenotazioni": [],
+  "notifiche": []
+}
