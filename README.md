@@ -12,3 +12,4 @@ utilizizamo questo git per fare capire agli altri cosa abbiamo fatto
 cosi facendo arrivas la richiesta e bisogna farla accettare
 5) git branch -d nome branch
 per cancellare un branch che non ci serve piu
+
